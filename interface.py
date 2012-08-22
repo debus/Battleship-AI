@@ -31,12 +31,12 @@ def ReadNoWait( out, queue):
         queue.put(line)
 
 class irc_client_message(object):
-    match_strings = (r"^([^ :]+) :([^ :]+) :(.+)$", )
+    match_strings = (r"^([^ :]+) :([^:]+):(.*)$" , )
     compiled_regexes = (re.compile(match_strings[0]) ,)
-    def __init__(self, strang=None, msg_type="PRIVMSG", recipient=None, message=None):
+    def __init__(self, strang=None, msg_type="PRIVMSG", recipient=None, params=None, message=None):
         self.msg_type = msg_type
-        self.recipient = recipient
         self.message = message
+        self.params = params
         self.parsed = False
         if(strang != None):
             self.parsed = self.parse_string(strang)
@@ -49,7 +49,9 @@ class irc_client_message(object):
             return False
         groups = matches.groups("")
         self.msg_type = groups[0]
-        self.recipient = groups[1]
+        params = groups[1].split(' ')
+        self.recipient = params[0]
+        self.params = params[1:]
         self.message = groups[2]
         self.parsed = True
         return True
@@ -84,7 +86,7 @@ class irc_server_message(object):
         self.message = matches.group(4)
         return self
 class irc_connection(object):
-    def __init__(self, host="irc.freenode.net" , port=6667, nick=None, ident="BOT_IDENT", realname="dBOT", owner="Philipp McBadass", channels=("#battleship")):
+    def __init__(self, host="irc.freenode.net" , port=6667, nick=None, ident="BOT_IDENT", realname="dBOT", owner="Philipp McBadass", channels=[]):
         self.host = host
         self.port = port
         self.nick = nick
@@ -99,24 +101,25 @@ class irc_connection(object):
         self.host = irc_connection.__merge_def_(host, self.host)
         self.port = irc_connection.__merge_def_(port, self.port)
         self.s.connect((self.host, self.port))
-    def join(self, channel):
-        self.channels = [channel]
-        self.joined = False
-        while(not self.joined):
-            self.s.send("JOIN " + self.channels[0] + " \n")
+    def join(self, channel, key = ""):
+        if(self.channels.count(channel) > 0):
+            return True
+        this_join = False
+        while(not this_join):
+            self.s.send("JOIN " + channel + " " + key + " \n")
             buff = irc_connection.__receive_buffer_(self.s)
             lines = irc_connection.__split_lines_(buff)
             i = 0
             l = len(lines)
             while(i<l):
-                print "<" + lines[i] + ">"
                 msg = irc_server_message(strang=lines[i])
                 if(msg.msg_type == "JOIN"):
                     print "JOINED " + channel
-                    self.joined = True
+                    this_join = True
                     break
                 i += 1          
-            if(i != l and self.joined == True):     
+            if(i != l and this_join == True):
+                self.channels.append(channel)     
                 self.cached_lines = lines[i+1:]
         return True
     @staticmethod
@@ -126,7 +129,7 @@ class irc_connection(object):
             inp += sock.recv(buffer_size) # recieve the server messages
         return inp
     @staticmethod
-    def __split_lines_(inp):
+    def __split_lines_(inp, print_lines=True):
         lines = inp.splitlines()
         l = len(lines)
         i = 1
@@ -137,6 +140,9 @@ class irc_connection(object):
                 l -= 1
                 continue
             i += 1
+        if(print_lines):
+            for line in lines:
+                print "<" + line + ">"
         return lines
     @staticmethod
     def __merge_def_(new=None, old=None):
@@ -157,6 +163,8 @@ class irc_connection(object):
                 line = lines[0:1][0]
                 self.cached_lines = lines[1:]
         return line
+    def set_connection_password(self, password):
+        self.s.send("PASS " + password + " \n")
     def register_nick(self, nick):
         self.nick = nick
         self.s.send("NICK " + nick + "\n")
@@ -170,7 +178,22 @@ class irc_connection(object):
         return irc_server_message(strang = self.get_next_line())
     def send_message(self, msg):
         self.s.send(msg.msg_type + " " + msg.recipient + " :" + msg.message + "\n")
-
+    def quit(self,  message="", do_action=False, action="Quitting!!!"):
+        if(do_action):
+            for channel in self.channels:
+                self.send_message(irc_server_message(msg_type="PRIVMSG", recipient=channel, message = chr(1)+"ACTION " + action + chr(1)))
+        self.channels = []
+        self.cached_lines = None
+        self.s.send("QUIT " + message + " \n")
+    def leave_channel(self, channel, message=""):
+        if(self.channels.count(channel) > 0):
+            self.channels.remove(channel)
+            self.s.send("PART " + channel + " " + message + " \n")
+    def leave_channels(self, channels, message=""):
+        for channel in channels:
+            self.leave_channel(channel, message)
+    def register_service(self, info, distribution="*"):
+        self.s.send("SERVICE " + self.nick + "  * " + distribution + " 0 0 :" + info + " \n")
 class irc_server_thread(threading.Thread):
     def __init__(self, connection):
         self.connection = connection
@@ -182,7 +205,7 @@ class irc_server_thread(threading.Thread):
         while True:
             line = self.connection.get_next_line()
             msg = irc_server_message(strang = line)
-            if(not self.handle_server_message(msg)):
+            if(self.handle_server_message(msg) == False):
                 self.Dexecuting = False
                 print "/Server thread"
                 return   
@@ -191,15 +214,12 @@ class irc_server_thread(threading.Thread):
             self.connection.s.send("PONG "+msg.sender+"\n")
             print "PONG "+msg.sender
             return True
-        if(msg.message == "$4COCK" and self.connection.joined):
-            self.connection.send_message(irc_server_message(msg_type = "PRIVMSG", recipient = msg.recipient, message = chr(1)+"ACTION Quitting!!!!"+chr(1)))
-            self.connection.send_message(irc_server_message(msg_type = "QUIT", recipient=msg.recipient, message="QUITTING!!!!"))
-            self.connection.joined = False
+        if(msg.message == "$4COCK"):
+            self.connection.quit(do_action = True)
             Write("[quit]", proc)
             return False
-        if(self.connection.joined):
-            Write("<[" + msg.msg_type + ":"  + msg.sender + ":"+ msg.recipient + ":" + msg.message + "]>\n", proc)
-            return True         
+        Write(msg.msg_type + ":"  + msg.sender + ":"+ msg.recipient + ":" + msg.message + "\n", proc)
+        return True         
 class irc_client_thread(threading.Thread):
     def __init__(self, connection, qu):
         self.connection = connection
@@ -230,19 +250,23 @@ def main():
     connection.register_nick("GHB578645")
     connection.register_ident(ident="GHB578645_BOT_IDENT", realname="GHB578645_BOT_REALNAME")
     connection.join("#battleship_testing")
-    
     qu = Queue()
     server_thread = irc_server_thread(connection)
-    client_thread = irc_client_thread(connection, qu)
     msg_thread = msg_read_thread(qu, proc.stdout)
+
     server_thread.daemon = True
-    client_thread.daemon = True
     msg_thread.daemon = True
     server_thread.start()
-    client_thread.start()
     msg_thread.start()
-    while(client_thread.isAlive() and server_thread.isAlive()):
-        pass
+    connection.register_service("This is a test of the service registration module, nothing to see here, move along.")
+    while(server_thread.isAlive()):
+        try:
+            line = qu.get_nowait()
+        except Empty:
+            pass
+        else:
+            msg = irc_client_message(strang=line)
+            connection.send_message(msg)
     print "/main"
     return 0
 
