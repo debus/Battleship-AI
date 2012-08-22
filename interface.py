@@ -7,11 +7,17 @@ import os
 import subprocess
 import re
 import threading
+try:
+    from Queue import Queue, Empty
+except ImportError:
+    from queue import Queue, Empty  # python 3.x
 
-def Write( str, proc ):
+
+def Write( strang, proc ):
     old_stdout = sys.stdout
     sys.stdout = proc.stdin
-    print str
+    proc.stdin.write(strang)
+    proc.stdin.flush()
     sys.stdout = old_stdout
     return
 def Read( proc ):
@@ -20,12 +26,38 @@ def Read( proc ):
     str = raw_input()
     sys.stdin = old_stdin
     return str
+def ReadNoWait( out, queue):
+    for line in iter(out.readline, b''):
+        queue.put(line)
 
-class irc_message:
+class irc_client_message(object):
+    match_strings = (r"^([^ :]+) :([^ :]+) :(.+)$", )
+    compiled_regexes = (re.compile(match_strings[0]) ,)
+    def __init__(self, strang=None, msg_type="PRIVMSG", recipient=None, message=None):
+        self.msg_type = msg_type
+        self.recipient = recipient
+        self.message = message
+        self.parsed = False
+        if(strang != None):
+            self.parsed = self.parse_string(strang)
+    def parse_string(self, strang):
+        print strang
+        matches = irc_client_message.compiled_regexes[0].match(strang)
+        if(matches == None or len(matches.groups("")) < 3):
+            print "ERROR irc_client_message:<" + strang + ">"
+            self.parsed = False
+            return False
+        groups = matches.groups("")
+        self.msg_type = groups[0]
+        self.recipient = groups[1]
+        self.message = groups[2]
+        self.parsed = True
+        return True
+class irc_server_message(object):
     match_strings = (r"^([^ :]*) {0,1}:([^ ]+) {0,1}([^:]*):{0,1}([^\n]*)$", r"^([^ !]+)")
     compiled_regexes = (re.compile(match_strings[0]), re.compile(match_strings[1]) )
 
-    def __init__(self, strang="", command="", sender="", msg_type="", recipient="", message="", extra_params=""):
+    def __init__(self, strang=None, command="", sender="", msg_type="", recipient="", message="", extra_params=""):
         self.command = command
         self.sender = sender
         self.msg_type = msg_type
@@ -35,12 +67,12 @@ class irc_message:
         if(strang != None):
             self.parse_string(strang)
     def parse_string(self, strang):
-        matches = irc_message.compiled_regexes[0].match(strang)
+        matches = irc_server_message.compiled_regexes[0].match(strang)
         if(matches == None):
             print "ERROR " + strang
             return self
         self.command = matches.group(1)
-        self.sender = irc_message.compiled_regexes[1].match(matches.group(2)).group(1)
+        self.sender = irc_server_message.compiled_regexes[1].match(matches.group(2)).group(1)
         params = matches.group(3).split(' ')
         length = len(params)
         if(length > 0):
@@ -51,8 +83,7 @@ class irc_message:
                     self.extra_params = params[2:length-1]
         self.message = matches.group(4)
         return self
-
-class irc_connection:
+class irc_connection(object):
     def __init__(self, host="irc.freenode.net" , port=6667, nick=None, ident="BOT_IDENT", realname="dBOT", owner="Philipp McBadass", channels=("#battleship")):
         self.host = host
         self.port = port
@@ -79,7 +110,7 @@ class irc_connection:
             l = len(lines)
             while(i<l):
                 print "<" + lines[i] + ">"
-                msg = irc_message(strang=lines[i])
+                msg = irc_server_message(strang=lines[i])
                 if(msg.msg_type == "JOIN"):
                     print "JOINED " + channel
                     self.joined = True
@@ -136,37 +167,84 @@ class irc_connection:
         self.s.send("USER "+self.ident+" "+self.host+" NAME "+self.realname+"\n")
         return True
     def get_next_message(self):
-        return irc_message(strang = self.get_next_line())
+        return irc_server_message(strang = self.get_next_line())
     def send_message(self, msg):
         self.s.send(msg.msg_type + " " + msg.recipient + " :" + msg.message + "\n")
+
+class irc_server_thread(threading.Thread):
+    def __init__(self, connection):
+        self.connection = connection
+        self.Dexecuting = False
+        threading.Thread.__init__(self)
+    def run(self):
+        print "Server thread"
+        self.Dexecuting = True
+        while True:
+            line = self.connection.get_next_line()
+            msg = irc_server_message(strang = line)
+            if(not self.handle_server_message(msg)):
+                self.Dexecuting = False
+                print "/Server thread"
+                return   
+    def handle_server_message(self, msg):
+        if(msg.command == "PING"):
+            self.connection.s.send("PONG "+msg.sender+"\n")
+            print "PONG "+msg.sender
+            return True
+        if(msg.message == "$4COCK" and self.connection.joined):
+            self.connection.send_message(irc_server_message(msg_type = "PRIVMSG", recipient = msg.recipient, message = chr(1)+"ACTION Quitting!!!!"+chr(1)))
+            self.connection.send_message(irc_server_message(msg_type = "QUIT", recipient=msg.recipient, message="QUITTING!!!!"))
+            self.connection.joined = False
+            Write("[quit]", proc)
+            return False
+        if(self.connection.joined):
+            Write("<[" + msg.msg_type + ":"  + msg.sender + ":"+ msg.recipient + ":" + msg.message + "]>\n", proc)
+            return True         
+class irc_client_thread(threading.Thread):
+    def __init__(self, connection, qu):
+        self.connection = connection
+        self.qu = qu
+        threading.Thread.__init__(self)
+    def run(self):
+        print "client thread"
+        while True:
+            try:
+                line = self.qu.get_nowait()
+            except Empty:
+                pass
+            else:
+                msg = irc_client_message(strang=line)
+                connection.send_message(msg)
+        print "/client thread"
+class msg_read_thread(threading.Thread):
+    def __init__(self, qu, out):
+        self.qu = qu
+        self.out = out
+        threading.Thread.__init__(self)
+    def run(self):
+        while True:
+            ReadNoWait(self.out, self.qu)
 
 def main(): 
     connection.connect(host="irc.freenode.net", port=6667)
     connection.register_nick("GHB578645")
     connection.register_ident(ident="GHB578645_BOT_IDENT", realname="GHB578645_BOT_REALNAME")
     connection.join("#battleship_testing")
-    while True:
-        line = connection.get_next_line()
-        print "<" + line + ">"
-        msg = irc_message(strang = line)
-        if(not handle_message(msg, connection)):
-            break
-    return 0 #unreachable?
-
-def handle_message(msg, connection):
-    if(msg.command == "PING"):
-        connection.s.send("PONG "+msg.sender+"\n")
-        print "PONG "+msg.sender
-        return True
-    if(msg.message == "$4COCK" and connection.joined):
-        connection.send_message(irc_message(msg_type = "PRIVMSG", recipient = msg.recipient, message = chr(1)+"ACTION Quitting!!!!"+chr(1)))
-        connection.send_message(irc_message(msg_type = "QUIT", recipient=msg.recipient, message="QUITTING!!!!"))
-        Write("[quit]", proc)
-        return False
-    if(connection.joined):
-        Write("<[" + msg.msg_type + ":"  + msg.sender + ":"+ msg.recipient + ":" + msg.message + "]>", proc)
-        return True
-
+    
+    qu = Queue()
+    server_thread = irc_server_thread(connection)
+    client_thread = irc_client_thread(connection, qu)
+    msg_thread = msg_read_thread(qu, proc.stdout)
+    server_thread.daemon = True
+    client_thread.daemon = True
+    msg_thread.daemon = True
+    server_thread.start()
+    client_thread.start()
+    msg_thread.start()
+    while(client_thread.isAlive() and server_thread.isAlive()):
+        pass
+    print "/main"
+    return 0
 
 proc = subprocess.Popen(sys.argv[1], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 connection = irc_connection()
